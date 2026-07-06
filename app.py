@@ -2,23 +2,38 @@ import os
 import json
 from flask import Flask, request, jsonify
 import google.generativeai as genai
+from pymongo import MongoClient
+from datetime import datetime
 
 app = Flask(__name__)
 
-# Fetch the API key from Render Environment Variables
-API_KEY = os.environ.get("GEMINI_API_KEY")
+# --- Environment Variables ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+MONGO_URI = os.environ.get("MONGO_URI")
 
-if API_KEY:
-    genai.configure(api_key=API_KEY)
+# --- Setup Gemini AI ---
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 else:
-    print("Warning: GEMINI_API_KEY environment variable is missing!")
-
-# Setup the Gemini Model
+    print("Warning: GEMINI_API_KEY is missing!")
 model = genai.GenerativeModel('gemini-pro')
+
+# --- Setup MongoDB ---
+db = None
+if MONGO_URI:
+    try:
+        client = MongoClient(MONGO_URI)
+        db = client['element_mixer_db']
+        combinations_collection = db['combinations']
+        print("MongoDB connected successfully!")
+    except Exception as e:
+        print(f"MongoDB connection failed: {e}")
+else:
+    print("Warning: MONGO_URI is missing!")
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "Server is running perfectly!"}), 200
+    return jsonify({"status": "Element Mixer API with MongoDB is running!"}), 200
 
 @app.route('/api/mix', methods=['POST'])
 def mix_elements():
@@ -30,31 +45,56 @@ def mix_elements():
         if not element_1 or not element_2:
             return jsonify({"error": "Both elements are required."}), 400
             
-        # The strict prompt for Gemini to return only JSON
+        # Sort elements alphabetically to ensure "Fire+Water" is the same as "Water+Fire"
+        elements = sorted([element_1.strip().lower(), element_2.strip().lower()])
+        combo_id = f"{elements[0]}_{elements[1]}"
+        
+        # 1. Check if combination already exists in MongoDB
+        if db is not None:
+            existing_combo = combinations_collection.find_one({"_id": combo_id})
+            if existing_combo:
+                return jsonify({
+                    "success": True,
+                    "result_name": existing_combo["result_name"],
+                    "result_emoji": existing_combo["result_emoji"],
+                    "is_new_discovery": False
+                }), 200
+
+        # 2. If not found, ask Gemini to create a new one
         prompt = f"""
         You are a creative game logic engine for an 'Element Mixer' game.
-        Combine '{element_1}' and '{element_2}' into a single, logical new item, concept, or creature.
+        Combine '{elements[0]}' and '{elements[1]}' into a single, logical new item, concept, or creature.
         Be creative but make sense.
         Return ONLY a valid JSON object in this exact format (no markdown, no extra text):
         {{"result_name": "New Item Name", "result_emoji": "🎨"}}
         """
         
-        # Call Gemini API
         response = model.generate_content(prompt)
         response_text = response.text.strip()
         
-        # Remove any Markdown code block formatting if Gemini adds it accidentally
         if response_text.startswith("```json"):
             response_text = response_text[7:-3].strip()
             
-        # Parse the JSON response
         result_data = json.loads(response_text)
+        new_name = result_data.get("result_name", "Unknown")
+        new_emoji = result_data.get("result_emoji", "❓")
         
+        # 3. Save the new discovery to MongoDB
+        if db is not None:
+            combinations_collection.insert_one({
+                "_id": combo_id,
+                "element_1": elements[0],
+                "element_2": elements[1],
+                "result_name": new_name,
+                "result_emoji": new_emoji,
+                "discovered_at": datetime.utcnow()
+            })
+            
         return jsonify({
             "success": True,
-            "result_name": result_data.get("result_name", "Unknown"),
-            "result_emoji": result_data.get("result_emoji", "❓"),
-            "is_new_discovery": True # Later, we will check the database to set this True/False
+            "result_name": new_name,
+            "result_emoji": new_emoji,
+            "is_new_discovery": True
         }), 200
         
     except json.JSONDecodeError:
